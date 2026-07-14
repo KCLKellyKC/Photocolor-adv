@@ -2,7 +2,12 @@ import os
 import io
 import base64
 import random
-from flask import Flask, render_template, request, jsonify
+import datetime
+import uuid
+import tempfile
+import numpy as np
+import cv2
+from flask import Flask, render_template, request, jsonify, send_from_directory
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops, ImageDraw
 
 app = Flask(__name__)
@@ -171,7 +176,80 @@ STYLE_PRESETS = {
     }
 }
 
-# Image Processing Helpers
+# 7-Segment Stamp Drawing helpers
+def draw_7segment_char(draw, char, x, y, w=12, h=20, color=(255, 110, 20), thickness=2):
+    segments = {
+        '0': ['A', 'B', 'C', 'D', 'E', 'F'],
+        '1': ['B', 'C'],
+        '2': ['A', 'B', 'G', 'E', 'D'],
+        '3': ['A', 'B', 'G', 'C', 'D'],
+        '4': ['F', 'G', 'B', 'C'],
+        '5': ['A', 'F', 'G', 'C', 'D'],
+        '6': ['A', 'F', 'G', 'E', 'C', 'D'],
+        '7': ['A', 'B', 'C'],
+        '8': ['A', 'B', 'C', 'D', 'E', 'F', 'G'],
+        '9': ['A', 'B', 'C', 'D', 'F', 'G'],
+        '-': ['G'],
+        '\'': ['F_top'],
+        '/': ['diag'],
+        ':': ['dots']
+    }
+    
+    if char not in segments:
+        return
+        
+    active = segments[char]
+    half_h = h // 2
+    
+    coords = {
+        'A': [(x + 2, y), (x + w - 2, y)],
+        'B': [(x + w - 1, y), (x + w - 1, y + half_h)],
+        'C': [(x + w - 1, y + half_h), (x + w - 1, y + h)],
+        'D': [(x + 2, y + h), (x + w - 2, y + h)],
+        'E': [(x, y + half_h), (x, y + h)],
+        'F': [(x, y), (x, y + half_h)],
+        'G': [(x + 2, y + half_h), (x + w - 2, y + half_h)],
+        'F_top': [(x + 2, y), (x + 4, y + 4)],
+        'diag': [(x + w, y), (x, y + h)],
+    }
+    
+    if 'dots' in active:
+        # Draw colon dots
+        draw.rectangle([x + w//2 - 1, y + h//4 - 1, x + w//2 + 1, y + h//4 + 1], fill=color)
+        draw.rectangle([x + w//2 - 1, y + 3*h//4 - 1, x + w//2 + 1, y + 3*h//4 + 1], fill=color)
+    else:
+        for seg in active:
+            if seg in coords:
+                draw.line(coords[seg], fill=color, width=thickness)
+
+def apply_date_stamp(img):
+    """Draw a glowing, realistic 7-segment digital date stamp in the corner."""
+    now = datetime.datetime.now()
+    # Format: '26 07 14 (YY MM DD)
+    date_str = now.strftime("'%y %m %d")
+    
+    width, height = img.size
+    glow_layer = Image.new("RGB", img.size, (0, 0, 0))
+    draw = ImageDraw.Draw(glow_layer)
+    
+    char_w, char_h = 10, 16
+    char_gap = 4
+    total_w = len(date_str) * (char_w + char_gap)
+    
+    # Calculate placement in bottom right corner
+    start_x = width - total_w - 40
+    start_y = height - char_h - 40
+    
+    color = (255, 110, 20) # Retro orange
+    
+    for i, char in enumerate(date_str):
+        cx = start_x + i * (char_w + char_gap)
+        draw_7segment_char(draw, char, cx, start_y, char_w, char_h, color=color, thickness=2)
+        
+    blurred_glow = glow_layer.filter(ImageFilter.GaussianBlur(1.2))
+    return ImageChops.screen(img, blurred_glow)
+
+# Image Filters Helpers
 def apply_color_grade(img, r_shift, g_shift, b_shift):
     """Apply smooth photographic color grading using non-linear channel LUTs."""
     if r_shift == 0 and g_shift == 0 and b_shift == 0:
@@ -179,7 +257,6 @@ def apply_color_grade(img, r_shift, g_shift, b_shift):
     r, g, b = img.split()
     
     def get_lut(shift):
-        # Shift midtones while keeping shadows (0) and highlights (255) anchored
         factor = shift / 100.0
         return [min(255, max(0, int(p + 128 * factor * (1.0 - abs(p - 128) / 128.0)))) for p in range(256)]
         
@@ -209,7 +286,7 @@ def apply_split_toning(img, shadow_r, shadow_g, shadow_b, highlight_r, highlight
 def apply_pixelation(img):
     """Slightly lower the resolution to simulate CCD pixel texture."""
     width, height = img.size
-    shrink_factor = 0.70  # More aggressive zoom texture
+    shrink_factor = 0.70
     small = img.resize((int(width * shrink_factor), int(height * shrink_factor)), Image.Resampling.BILINEAR)
     return small.resize((width, height), Image.Resampling.NEAREST)
 
@@ -219,25 +296,20 @@ def apply_vignette(img, strength):
         return img
     width, height = img.size
     
-    # Create radial vignette mask
     grad_size = (100, 100)
     grad = Image.new("L", grad_size, 255)
     draw = ImageDraw.Draw(grad)
     cx, cy = 50, 50
     
-    # Max diagonal distance
     max_d = 70.7
     for r in range(75, 0, -1):
         dist = r / max_d
-        # Corners get darker by strength percentage
         val = int(255 - (255 * strength) * (dist ** 2.2))
         val = min(255, max(0, val))
         draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=val)
         
     mask = grad.resize((width, height), Image.Resampling.BILINEAR)
     mask_rgb = Image.merge("RGB", (mask, mask, mask))
-    
-    # Multiply exposure changes
     return ImageChops.multiply(img, mask_rgb)
 
 def apply_bloom(img, radius=12, opacity=0.3):
@@ -248,18 +320,13 @@ def apply_bloom(img, radius=12, opacity=0.3):
 
 def apply_cinestill_halation(img, radius=15, opacity=0.5):
     """Simulate Cinestill red halation glow around bright highlights."""
-    # Extract bright highlights (luminance > 200)
     luminance = img.convert("L")
     mask = luminance.point(lambda p: 255 if p > 200 else 0)
     
-    # Create a solid warm red-orange halation color layer
     red_layer = Image.new("RGB", img.size, (255, 55, 15))
     red_highlights = Image.composite(red_layer, Image.new("RGB", img.size, (0, 0, 0)), mask)
     
-    # Blur the red highlights to bleed outwards
     blurred_red = red_highlights.filter(ImageFilter.GaussianBlur(radius))
-    
-    # Blend back onto image using screen mode
     return Image.blend(img, ImageChops.screen(img, blurred_red), opacity)
 
 def apply_barrel_distortion(img, strength):
@@ -400,6 +467,64 @@ def apply_grain(img, grain_strength):
     blend_factor = (grain_strength / 100.0) * 0.20
     return Image.blend(img, noise_rgb, blend_factor)
 
+def apply_scratches_and_dust(img, strength):
+    """Overlay randomized vertical lines and dust specks."""
+    if strength <= 0:
+        return img
+    width, height = img.size
+    
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    
+    # Scratches (faint gray vertical lines)
+    num_scratches = int((strength / 100.0) * 4) + 1
+    for _ in range(num_scratches):
+        x = random.randint(15, width - 15)
+        length = random.randint(height // 5, height // 2)
+        y_start = random.randint(0, height - length)
+        y_end = y_start + length
+        x_end = x + random.randint(-3, 3)
+        
+        val = random.randint(120, 220)
+        alpha = random.randint(30, 95)
+        draw.line([(x, y_start), (x_end, y_end)], fill=(val, val, val, alpha), width=1)
+        
+    # Dust specks (dark spots)
+    num_dust = int((strength / 100.0) * 15)
+    for _ in range(num_dust):
+        x = random.randint(15, width - 15)
+        y = random.randint(15, height - 15)
+        r = random.randint(1, 2)
+        val = random.randint(15, 60)
+        alpha = random.randint(80, 200)
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=(val, val, val, alpha))
+        
+    return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+
+def apply_light_leaks(img, strength):
+    """Draw a soft warm orange leak from the border edge."""
+    if strength <= 0:
+        return img
+    width, height = img.size
+    
+    grad_size = (150, 150)
+    grad = Image.new("RGB", grad_size, (0, 0, 0))
+    draw = ImageDraw.Draw(grad)
+    cx, cy = 0, 75
+    
+    for r in range(150, 0, -2):
+        dist = r / 150.0
+        red = int(255 * (1.0 - dist**1.5))
+        green = int(90 * (1.0 - dist**1.5))
+        blue = int(15 * (1.0 - dist**2.0))
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(red, green, blue))
+        
+    leak_mask = grad.resize((width, height), Image.Resampling.BILINEAR)
+    leaked = ImageChops.screen(img, leak_mask)
+    
+    blend_factor = (strength / 100.0) * 0.70
+    return Image.blend(img, leaked, blend_factor)
+
 def process_image(img, preset, sliders):
     """Process an image according to style preset parameters and slider overrides."""
     if img.mode != "RGB":
@@ -410,15 +535,12 @@ def process_image(img, preset, sliders):
     img.thumbnail((max_size, max_size))
     
     # 1. Base Preset Adjustments
-    # Saturation
     sat_factor = preset.get("saturation", 1.0)
     img = ImageEnhance.Color(img).enhance(sat_factor)
     
-    # Contrast
     cont_factor = preset.get("contrast", 1.0)
     img = ImageEnhance.Contrast(img).enhance(cont_factor)
     
-    # Brightness
     bright_factor = preset.get("brightness", 1.0)
     img = ImageEnhance.Brightness(img).enhance(bright_factor)
     
@@ -478,6 +600,14 @@ def process_image(img, preset, sliders):
     # Apply Grain
     img = apply_grain(img, sliders["grain"])
     
+    # Apply Scratches & Dust (dynamic analog lines)
+    if sliders.get("scratches", 0) > 0:
+        img = apply_scratches_and_dust(img, sliders["scratches"])
+        
+    # Apply Light Leaks
+    if sliders.get("light_leaks", 0) > 0:
+        img = apply_light_leaks(img, sliders["light_leaks"])
+        
     # Final Intensity Blending (Style Strength)
     intensity_factor = sliders["intensity"] / 100.0
     final_img = Image.blend(original_copy, img, intensity_factor)
@@ -486,6 +616,10 @@ def process_image(img, preset, sliders):
     skin_factor = sliders["skin"] / 100.0
     if skin_factor > 0:
         final_img = Image.blend(final_img, original_copy, skin_factor * 0.22)
+
+    # Apply Date Stamp at the very top of output
+    if sliders.get("date_stamp", False):
+        final_img = apply_date_stamp(final_img)
 
     return final_img
 
@@ -510,7 +644,10 @@ def api_transfer():
             "sharpness": int(request.form.get('sharpness', 50)),
             "skin": int(request.form.get('skin', 90)),
             "flash": int(request.form.get('flash', 0)),
-            "hdr": int(request.form.get('hdr', 40))
+            "hdr": int(request.form.get('hdr', 40)),
+            "scratches": int(request.form.get('scratches', 0)),
+            "light_leaks": int(request.form.get('light_leaks', 0)),
+            "date_stamp": request.form.get('date_stamp') == 'true'
         }
         
         image_bytes = file.read()
@@ -540,6 +677,111 @@ def api_transfer():
         return jsonify({
             "success": True,
             "styled_image": f"data:image/png;base64,{base64_img}"
+        })
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+# Video Process Endpoint
+@app.route('/api/transfer_video', methods=['POST'])
+def api_transfer_video():
+    try:
+        file = request.files.get('video')
+        if not file:
+            return jsonify({"error": "No video uploaded"}), 400
+            
+        mix_enabled = request.form.get('mix_enabled') == 'true'
+        
+        sliders = {
+            "intensity": int(request.form.get('intensity', 80)),
+            "grain": int(request.form.get('grain', 15)),
+            "dof": int(request.form.get('dof', 20)),
+            "sharpness": int(request.form.get('sharpness', 50)),
+            "skin": int(request.form.get('skin', 90)),
+            "flash": int(request.form.get('flash', 0)),
+            "hdr": int(request.form.get('hdr', 40)),
+            "scratches": int(request.form.get('scratches', 0)),
+            "light_leaks": int(request.form.get('light_leaks', 0)),
+            "date_stamp": request.form.get('date_stamp') == 'true'
+        }
+        
+        # Save video to temp file
+        temp_dir = tempfile.gettempdir()
+        input_filename = f"input_{uuid.uuid4().hex}.mp4"
+        input_path = os.path.join(temp_dir, input_filename)
+        file.save(input_path)
+        
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            return jsonify({"error": "Failed to open video"}), 500
+            
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0: fps = 30.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Downscale to max 640px height/width for super fast local compilation
+        max_dim = 640
+        if width > max_dim or height > max_dim:
+            if width > height:
+                new_w = max_dim
+                new_h = int(height * (max_dim / width))
+            else:
+                new_h = max_dim
+                new_w = int(width * (max_dim / height))
+            width, height = new_w, new_h
+            
+        output_filename = f"styled_{uuid.uuid4().hex}.mp4"
+        output_dir = os.path.join(r"c:\Users\Kathie_Lee\Downloads\Photocoloradv", "static", "processed")
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, output_filename)
+        
+        # Write using mp4v codec (most compatible locally)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        if mix_enabled:
+            p_style = request.form.get('primary_style', 'ccd')
+            s_style = request.form.get('secondary_style', 'leica')
+            p_preset = STYLE_PRESETS.get(p_style, STYLE_PRESETS['ccd'])
+            s_preset = STYLE_PRESETS.get(s_style, STYLE_PRESETS['leica'])
+        else:
+            style_id = request.form.get('style', 'ccd')
+            preset = STYLE_PRESETS.get(style_id, STYLE_PRESETS['ccd'])
+            
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            frame = cv2.resize(frame, (width, height))
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img_pil = Image.fromarray(frame_rgb)
+            
+            # Apply styling
+            if mix_enabled:
+                img_p = process_image(img_pil.copy(), p_preset, sliders)
+                img_s = process_image(img_pil.copy(), s_preset, sliders)
+                img_styled = Image.blend(img_s, img_p, 0.70)
+            else:
+                img_styled = process_image(img_pil, preset, sliders)
+                
+            frame_out = cv2.cvtColor(np.array(img_styled), cv2.COLOR_RGB2BGR)
+            out.write(frame_out)
+            
+        cap.release()
+        out.release()
+        
+        try:
+            os.remove(input_path)
+        except:
+            pass
+            
+        return jsonify({
+            "success": True,
+            "video_url": f"/static/processed/{output_filename}"
         })
         
     except Exception as e:
